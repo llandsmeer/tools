@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import subprocess
+import glob
+import collections
+import itertools
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Pango, Gdk
+
+class ManNavigator(Gtk.Window):
+
+    pattern_manref = r'([a-z_A-Z0-9]+) ?\(([0-9][a-zA-Z]?)?\)'
+    pattern_manref_alt = r'(.*?) ([0-9]+[a-zA-Z]?)'
+    keyconfig = '''
+        focus_searchbar o Control_L+l
+        hscroll_line:-3 k
+        hscroll_line:+3 j
+        hscroll_page:-0.5 u
+        hscroll_page:+0.5 d
+        hscroll_page:-1 Shift_L+space
+        hscroll_page:+1 space
+    '''
+
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        self.init_keymap()
+        self.current_section = None
+        self.index = file_index()
+
+    def init_ui(self):
+        self.grid = grid = Gtk.Grid()
+        self.searchbar = searchbar = Gtk.Entry()
+        self.scroll = scroll = Gtk.ScrolledWindow()
+        self.textview = textview = Gtk.TextView()
+        self.textbuffer = textbuffer = textview.get_buffer()
+        self.taglink = taglink = textbuffer.create_tag(
+            'link', underline=Pango.Underline.SINGLE)
+        self.completion = completion = Gtk.EntryCompletion()
+        self.completions = completions = Gtk.ListStore.new([str, str])
+        self.completion.set_text_column(0)
+        # config
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(True)
+        textview.set_editable(False)
+        textview.set_property('cursor-visible', False)
+        searchbar.set_icon_from_stock(Gtk.PositionType.RIGHT, Gtk.STOCK_FIND)
+        searchbar.set_completion(completion)
+        completion.set_model(completions)
+        # events
+        taglink.connect('event', self.on_taglink_event)
+        textview.connect('key-press-event', self.on_textview_key_press)
+        searchbar.connect('key-press-event', self.on_searchbar_key_press)
+        searchbar.connect('activate', self.on_searchbar_activate)
+        searchbar.connect('changed', self.on_searchbar_changed)
+        completion.connect('match-selected', self.on_completion_match_selected)
+        # hiearchy
+        self.add(grid)
+        grid.add(searchbar)
+        grid.attach_next_to(scroll, searchbar, Gtk.PositionType.BOTTOM, 1, 1)
+        scroll.add(textview)
+        self.set_focus(textview)
+
+    def init_keymap(self):
+        self.keymap = {}
+        for line in self.keyconfig.splitlines():
+            if not line.strip():
+                continue
+            cmd, *chords = line.split()
+            action, *args = cmd.split(':', maxsplit=1)
+            if args:
+                args = args[0].split(',')
+            for chord in chords:
+                f = actions[action]
+                if f.__code__.co_argcount == 1 + len(args):
+                    self.keymap[parse_chord(chord)] = f, args
+                else:
+                    raise Exception('incorrect argcount: ' + line)
+
+    def navigate(self, page, section=None):
+        print(page, section)
+        text = read_man_page(page, section)
+        if not text:
+            return False
+        first = True
+        for match in re.finditer(self.pattern_manref, text):
+            if first:
+                self.set_title(match.group(0))
+                self.current_section = match.group(2)
+                self.textbuffer.set_text(text)
+                first = False
+            page = match.group(1)
+            section = match.group(2) or self.current_section
+            if page in self.index[section]:
+                start = self.textbuffer.get_iter_at_offset(match.start())
+                end = self.textbuffer.get_iter_at_offset(match.end())
+                self.textbuffer.apply_tag(self.taglink, start, end)
+        return True
+
+    def on_searchbar_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.set_focus(self.textview)
+
+    def on_textview_key_press(self, widget, event):
+        f = None
+        try:
+            f, args = self.keymap[event.keyval]
+        except KeyError:
+            print('unknown chord', event.string)
+        if f:
+            f(self, *args)
+        return True
+
+    def on_completion_match_selected(self, widget, model, treeiter):
+        self.search(model.get(treeiter, 0)[0])
+
+    def on_searchbar_activate(self, searchbar):
+        self.search(searchbar.get_text())
+
+    def search(self, query):
+        print(repr(query))
+        match = re.match(self.pattern_manref, query)
+        print(1, match)
+        if not match:
+            match = re.match(self.pattern_manref_alt, query)
+            print(2, match)
+        if match:
+            succes = self.navigate(match.group(1), match.group(2))
+        else:
+            succes = self.navigate(query)
+        if succes:
+            self.set_focus(self.textview)
+
+    def on_searchbar_changed(self, searchbar):
+        def match_pages(query):
+            query = query.lower()
+            top = set()
+            for section in self.index.values():
+                for page in section:
+                    if page.lower().startswith(query) and page not in top:
+                        top.add(page)
+                    if len(top) >= 10:
+                        return top
+            return list(top)
+        self.completions.clear()
+        for item in match_pages(searchbar.get_text()):
+            for definition in man_whatis(item):
+                self.completions.append(definition)
+        self.completion.complete()
+
+    def on_taglink_event(self, tag, obj, event, textiter):
+        if event.type != Gdk.EventType.BUTTON_PRESS:
+            return
+        textiter.backward_to_tag_toggle(tag)
+        start = textiter.copy()
+        textiter.forward_to_tag_toggle(tag)
+        text = self.textbuffer.get_text(start, textiter, False)
+        match = re.match(self.pattern_manref, text)
+        if match:
+            self.navigate(match.group(1), match.group(2) or self.current_section)
+
+actions = {}
+def register_actions(_, __, props):
+    actions.update(prop for prop in props.items() if callable(prop[1]))
+
+class Actions(metaclass=register_actions):
+    def focus_searchbar(self):
+        self.set_focus(self.searchbar)
+
+    def hscroll_line(self, n):
+        adjust = self.scroll.get_vadjustment()
+        line = self.textview.get_line_yrange(self.textbuffer.get_start_iter())[1]
+        adjust.set_value(adjust.get_value()+float(n)*line)
+
+    def hscroll_page(self, n):
+        adjust = self.scroll.get_vadjustment()
+        page = self.textview.get_allocation().height
+        adjust.set_value(adjust.get_value()+float(n)*page)
+
+def parse_chord(chord):
+    mask = 0
+    for name in chord.split('+'):
+        keyval = Gdk.keyval_from_name(name)
+        if keyval == 0xffffff:
+            raise Exception('invalid key ' + name)
+        mask |= keyval
+    return mask
+
+def read_man_page(page, section=None):
+    if page.startswith('-'):
+        return False
+    cmd = ['man', '-P', 'col -b', page]
+    if not section is None:
+        cmd.insert(-1, section)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    output = p.communicate()[0]
+    if p.wait():
+        return False
+    return output.decode('utf8')
+
+def man_whatis(item):
+    if item.startswith('-'):
+        return ()
+    p = subprocess.Popen(['whatis', item] , stdout=subprocess.PIPE)
+    output = p.communicate()[0]
+    if p.wait():
+        return ()
+    for line in output.decode('utf8').splitlines():
+        k, v = map(str.strip, line.split('-', maxsplit=1))
+        yield k, v
+
+def manpath():
+    return [path.decode('utf8') for path in subprocess.check_output('manpath').split(b':')]
+
+def file_index():
+    index = collections.defaultdict(dict)
+    for directory in manpath():
+        for section_path in glob.glob(os.path.join(directory, 'man*')):
+            if not os.path.basename(section_path)[3:].isdigit():
+                continue
+            for filepath in glob.glob(os.path.join(section_path, '*.gz')):
+                base, section, _gz = os.path.basename(filepath).rsplit('.', maxsplit=2)
+                if base in index[section]:
+                    continue
+                index[section][base] = filepath
+    return index
+
+def main():
+    window = ManNavigator()
+    window.connect('delete-event', Gtk.main_quit)
+    window.show_all()
+    window.navigate('man')
+    if len(sys.argv) == 3:
+        window.navigate(sys.argv[2], sys.argv[1])
+    elif len(sys.argv) == 2:
+        window.navigate(sys.argv[1])
+    Gtk.main()
+
+if __name__ == '__main__':
+    main()
