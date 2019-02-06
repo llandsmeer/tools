@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+
+import sys
+import os.path
+import re
+import argparse
+import struct
+import subprocess
+
+START_MAGIC = b'Vim\x9fUnDo\xe5'
+HEADER_MAGIC = 0x5fd0
+HEADER_END_MAGIC = 0xe7aa
+ENTRY_MAGIC = 0xf518
+ENTRY_END_MAGIC = 0x3581
+VERSION = 2
+HASH_SIZE = 16
+LAST_SAVE_NR = 1
+SAVE_NR = 1
+HASH_SIZE = 32
+NMARKS = 26
+
+def c8(stream): return struct.unpack_from('>L', stream.read(8))[0]
+def c4(stream): return struct.unpack_from('>I', stream.read(4))[0]
+def c2(stream): return struct.unpack_from('>H', stream.read(2))[0]
+def c1(stream): return struct.unpack_from('>B', stream.read(1))[0]
+
+class Undofile:
+    def __init__(self):
+        self.line_count = 0
+        self.line = b''
+        self.line_lnum = 0
+        self.line_colnr = 0
+        self.uhp_table = []
+        self.cur_idx = self.old_idx = self.new_idx = None
+        self.old_head = self.new_head = self.cur_head = None
+
+def read_undo_stream(stream):
+    assert stream.read(len(START_MAGIC)) == START_MAGIC
+    assert c2(stream) == VERSION
+    stream.read(HASH_SIZE)
+    line_count = c4(stream)
+    str_len = c4(stream)
+    line = stream.read(str_len)
+    line_lnum = c4(stream)
+    line_colnr = c4(stream)
+    old_header_seq = c4(stream)
+    new_header_seq = c4(stream)
+    cur_header_seq = c4(stream)
+    num_head = c4(stream)
+    seq_last = c4(stream)
+    seq_cur = c4(stream)
+    seq_time = c8(stream)
+    old_idx = new_idx = cur_idx = -1
+    while True:
+        data_len = c1(stream)
+        if data_len == 0:
+            break
+        what = c1(stream)
+        if what == LAST_SAVE_NR:
+            last_save_nr = c4(stream)
+        else:
+            stream.read(data_len)
+    uhp_table = []
+    while True:
+        c = c2(stream)
+        if c != HEADER_MAGIC:
+            break
+        uhp_table.append(unserialize_uhp(stream))
+    assert c == HEADER_END_MAGIC
+    assert len(uhp_table) == num_head
+    for i in range(num_head):
+        uhp = uhp_table[i]
+        if not uhp:
+            continue
+        for j in range(num_head):
+            if uhp_table[j] and i != j:
+                assert uhp.seq != uhp_table[j].seq
+        for j in range(num_head):
+            if uhp_table[j] and uhp.next_seq == uhp_table[j].seq:
+                uhp.next = uhp_table[j]
+                break
+        for j in range(num_head):
+            if uhp_table[j] and uhp.prev_seq == uhp_table[j].seq:
+                uhp.prev = uhp_table[j]
+                break
+        for j in range(num_head):
+            if uhp_table[j] and uhp.alt_next == uhp_table[j].seq:
+                uhp.alt_next = uhp_table[j]
+                break
+        for j in range(num_head):
+            if uhp_table[j] and uhp.alt_prev == uhp_table[j].seq:
+                uhp.alt_prev = uhp_table[j]
+                break
+        if old_header_seq > 0 and old_idx < 0 and uhp.seq == old_header_seq:
+            old_idx = i
+        if new_header_seq > 0 and new_idx < 0 and uhp.seq == new_header_seq:
+            new_idx = i
+        if cur_header_seq > 0 and cur_idx < 0 and uhp.seq == cur_header_seq:
+            cur_idx = i
+    undofile = Undofile()
+    undofile.line = line
+    undofile.line_colnr = line_colnr
+    undofile.line_lnum = line_lnum
+    undofile.line_count = line_count
+    undofile.uhp_table = uhp_table
+    undofile.cur_idx = cur_idx
+    undofile.old_idx = old_idx
+    undofile.new_idx = new_idx
+    undofile.new_head = uhp_table[new_idx] if new_idx >= 0 else None
+    undofile.old_head = uhp_table[old_idx] if old_idx >= 0 else None
+    undofile.cur_head = uhp_table[cur_idx] if cur_idx >= 0 else None
+    return undofile
+
+class UHP:
+    def __init__(self):
+        self.prev = self.next = self.alt_next = self.alt_prev = None
+        self.prev_seq = self.next_seq = self.alt_next_seq = self.alt_prev_seq = None
+        self.cursor = None
+        self.flags = 0
+        self.named_marks = []
+        self.save_nr = None
+        self.entry = None
+        self.time = None
+
+def unserialize_uhp(stream):
+    uhp = UHP()
+    uhp.next_seq = c4(stream)
+    uhp.prev_seq = c4(stream)
+    uhp.alt_next_seq = c4(stream)
+    uhp.alt_prev_seq = c4(stream)
+    uhp.seq = c4(stream)
+    uhp.cursor = unserialize_pos(stream)
+    c4(stream) # virtual edit
+    uhp.flags = c2(stream)
+    for i in range(NMARKS):
+        uhp.named_marks.append(unserialize_pos(stream))
+    uhp.visual = unserialize_visual_info(stream)
+    uhp.time = c8(stream)
+    while True:
+        data_len = c1(stream)
+        if data_len == 0:
+            break
+        what = c1(stream)
+        if what == SAVE_NR:
+            uhp.save_nr = c4(stream)
+        else:
+            stream.read(data_len)
+    last_uep = None
+    while True:
+        c = c2(stream)
+        if c != ENTRY_MAGIC:
+            break
+        uep = unserialize_uep(stream)
+        if last_uep is None:
+            uhp.entry = uep
+        else:
+            last_uep.next = uep
+        last_uep = uep
+        assert uep
+    assert c == ENTRY_END_MAGIC
+    return uhp
+
+def unserialize_pos(stream):
+    lnum = c4(stream)
+    col = c4(stream)
+    c4(stream) # virtual edit
+    return lnum, col
+
+def unserialize_visual_info(stream):
+    start = unserialize_pos(stream)
+    end = unserialize_pos(stream)
+    mode = c4(stream)
+    curswant = c4(stream)
+    return start, end, mode, curswant
+
+class UEP:
+    def __init__(self):
+        self.next = None
+        self.top = self.bot = self.lcount = self.size = None
+        self.array = []
+
+def unserialize_uep(stream):
+    uep = UEP()
+    uep.top = c4(stream)
+    uep.bot = c4(stream)
+    uep.lcount = c4(stream)
+    uep.size = c4(stream)
+    for i in range(uep.size):
+        line_len = c4(stream)
+        line = stream.read(line_len)
+        uep.array.append(line)
+    return uep
+
+def read_undo_file(filename):
+    with open(filename, 'rb') as stream:
+        return read_undo_stream(stream)
+
+def reconstruct(source, undofile):
+    with open(source, 'rb') as sourcestream:
+        lines = [line[:-1] for line in sourcestream]
+    with open(undofile, 'rb') as undostream:
+        undo = read_undo_stream(undostream)
+    yield 'current', lines
+    uhp = undo.new_head
+    while uhp:
+        entry = uhp.entry
+        while entry:
+            bot = entry.bot-1 if entry.bot else len(lines)
+            lines[entry.top:bot] = entry.array
+            entry = entry.next
+        yield uhp.save_nr, lines
+        uhp = uhp.next
+
+def add_blob(content):
+    process = subprocess.run('git hash-object -w --stdin'.split(),
+            input=content,
+            stdout=subprocess.PIPE)
+    if process.returncode != 0:
+        exit(process.returncode)
+    return process.stdout.decode('latin1').rstrip('\n')
+
+def write_tree(filename, blob):
+    tree = '100644 blob %s\t%s\n' % (blob, filename)
+    process = subprocess.run('git mktree'.split(),
+            input=tree.encode('utf8'),
+            stdout=subprocess.PIPE)
+    if process.returncode != 0:
+        exit(process.returncode)
+    return process.stdout.decode('latin1').rstrip('\n')
+
+def commit(*, message, tree, parent=None):
+    args = 'git commit-tree'.split()
+    args.append(tree)
+    if not parent is None:
+        args.extend(['-p', parent])
+    args.extend(['-m', message])
+    process = subprocess.run(args, stdout=subprocess.PIPE)
+    if process.returncode != 0:
+        exit(process.returncode)
+    return process.stdout.decode('latin1').rstrip('\n')
+
+def git_vim_read_undofile(options):
+    revisions = reconstruct(options.file, options.undo)
+    trees = []
+    for save_nr, lines in revisions:
+        if save_nr:
+            rev_hash = add_blob(b'\n'.join(lines + [b'']))
+            if not options.quiet:
+                print('blob', rev_hash, save_nr)
+            if options.action == 'blobs':
+                continue
+            tree_hash = write_tree(options.name, rev_hash)
+            if not options.quiet:
+                print('tree', tree_hash, save_nr)
+            trees.append((save_nr, tree_hash))
+    if options.action != 'commits':
+        return
+    parent = None
+    for save_nr, tree_hash in reversed(trees):
+        commit_hash = commit(message=str(save_nr), tree=tree_hash, parent=parent)
+        parent = commit_hash
+        if not options.quiet:
+            print('commit', commit_hash, save_nr)
+    if options.quiet and parent:
+        print(parent)
+
+def isgit():
+    return os.path.isdir('.git')
+
+def remove_ansi_seqs(data):
+    return re.sub(b'(\x9b|\x1b\[)[0-?]*[ -/*[@-~]', b'', data)
+
+def guess_undofile(filename):
+    escaped = filename.replace('\\', '\\\\').replace('"', '\\"')
+    process = subprocess.run(['vim', '-e',
+        '+echo undofile("' + escaped + '")', '+qall', '-X'],
+        stdout=subprocess.PIPE)
+    if process.returncode != 0:
+        return
+    return remove_ansi_seqs(process.stdout).decode('utf8').strip()
+
+def main():
+    parser = argparse.ArgumentParser(description='import a vim undofile in git')
+    parser.set_defaults(action='commits')
+    parser.add_argument('-f', '--file', metavar='FILE', required=True,
+            help='path to file')
+    parser.add_argument('-u', '--undo', metavar='FILE',
+            help='path to undofile')
+    parser.add_argument('-n', '--name', metavar='NAME',
+            help='filename in git')
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument('--blobs', action='store_const', dest='action',
+            help='write only blobs', const='blobs')
+    action_group.add_argument('--trees', action='store_const', dest='action',
+            help='write only blobs and trees', const='trees')
+    parser.add_argument('-q', '--quiet', action='store_true',
+            help='show only last commmit hash')
+    options = parser.parse_args()
+    if options.undo is None:
+        options.undo = guess_undofile(options.file)
+        if not options.undo:
+            print('could not guess undofile path', file=sys.stderr)
+            exit(1)
+    if options.name is None:
+        options.name = os.path.basename(options.file)
+    git_vim_read_undofile(options)
+
+if __name__ == '__main__':
+    main()
