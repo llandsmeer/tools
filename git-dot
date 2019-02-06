@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# Copyright (c) 2016, Lennart Landsmeer <lennart@landsmeer.email>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+# REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+# INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+# LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+# OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+
+set -e
+
+USAGE='[--show] [--commits] [--trees] [--refs] [--heads]'
+
+. "$(git --exec-path)/git-sh-setup"
+
+OPTION_SHOW=false
+OPTION_HELP=false
+OPTION_FILTER=false
+OPTION_COMMITS=false
+OPTION_TREES=false
+OPTION_HEADS=false
+OPTION_REFS=false
+
+for arg in "$@"
+do
+    case "$arg" in
+        --show)
+            OPTION_SHOW=true
+            ;;
+        --commits)
+            OPTION_FILTER=true
+            OPTION_COMMITS=true
+            ;;
+        --trees)
+            OPTION_FILTER=true
+            OPTION_COMMITS=true
+            OPTION_TREES=true
+            ;;
+        --refs)
+            OPTION_FILTER=true
+            OPTION_REFS=true
+            ;;
+        --heads)
+            OPTION_FILTER=true
+            OPTION_HEADS=true
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+handle_object() {
+    object=$1
+    objtype=$(git cat-file -t $object)
+    short=$(head -c 7 <<< $object)
+    header="$objtype $short"
+    description=""
+    color=''
+    edges=''
+    case $objtype in
+        blob)
+            $OPTION_FILTER && continue
+            description="$(git cat-file -p $object | wc -c) bytes"
+            color='#777777'
+            ;;
+        tree)
+            $OPTION_FILTER && ! $OPTION_TREES && continue
+            if $OPTION_TREES
+            then
+                edges=
+            else
+                edges=$(git ls-tree $object | awk '{print $3":"$4}')
+            fi
+            color='#00ff77'
+            ;;
+        commit)
+            $OPTION_FILTER && ! $OPTION_COMMITS && continue
+            if $OPTION_COMMITS && ! $OPTION_TREES
+            then
+                edges=$(git cat-file -p $object |\
+                            awk '/^^parent/ {print $2} /^$/ {exit}')
+            else
+                edges=$(git cat-file -p $object |\
+                            awk '/^tree|^parent/ {print $2} /^$/ {exit}')
+            fi
+            description=$(git cat-file -p $object |\
+                              sed '/^$/{n;q};d' |\
+                              tail -n 1)
+            color='#0077ff'
+            ;;
+    esac
+    echo '    "'$object'"'\
+            '[label="'"$header\n$description"'", color="'$color'"]'
+    for edge in $edges
+    do
+        target=$(echo $edge | cut -d':' -f1)
+        label=$(echo $edge | cut -s -d':' -f2)
+        if [ -z "$label" ]; then
+            echo '    "'$object'" -> "'$target'"'
+        else
+            echo '    "'$object'" -> "'$target'" [label="'"$label"'"]'
+        fi
+    done
+}
+
+handle_ref() {
+    name="$1"
+    target="$2"
+    case "$target" in
+        "ref: "*)
+            target=${target#ref: refs/}
+            ;;
+    esac
+    echo '    "'"$name"'" [color="#ff7700"]'
+    echo '    "'"$name"'" -> "'"$target"'"'
+}
+
+do_objects() {
+    objects=$(find "$GIT_OBJECT_DIRECTORY" |\
+                   sed 's:^.*\([0-9a-f]\{2\}\)/\([0-9a-f]\{38\}\)$:\1\2:g;t;d')
+
+    for object in $objects
+    do
+        handle_object $object
+    done
+}
+
+do_refs() {
+    refsbase="$GIT_DIR/refs"
+    for file in ${refsbase}/heads/* ${refsbase}/tags/* ${refsbase}/remotes/*/*
+    do
+        name="${file#$refsbase/}"
+        case "$file" in
+            *"*")
+                ;;
+            *)
+                handle_ref "${file#$refsbase/}" "$(cat "$file")"
+                ;;
+        esac
+    done
+}
+
+do_packed_refs() {
+    packedrefsfile="$GIT_DIR/packed-refs"
+    if [ -f "$packedrefsfile" ]
+    then
+        for packedref in $(sed '/^#/d' "$packedrefsfile" |\
+                               awk '{print$1":"$2}')
+        do
+            target=$(echo "$packedref" | cut -d':' -f1)
+            file="$(echo "$packedref" | cut -d':' -f2)"
+            if [ ! -f "$GIT_DIR/$file" ]
+            then
+                handle_ref "${file#refs/}" "$target"
+            fi
+        done
+    fi
+}
+
+do_packed_objects() {
+    MATCH_PACKED_DELTA=$(echo \
+        '^([0-9a-f]{40})\s[a-z]+(\s+[0-9]+){3}(\s+[0-9]+\s+([0-9a-f]{40}))?$')
+    for packfile in "$GIT_OBJECT_DIRECTORY"/pack/*.idx
+    do
+        case "$packfile" in
+            *"*.idx")
+                ;;
+            *)
+                packeddeltas=$(git verify-pack -v "$packfile" |\
+                        sed -E 's/'"$MATCH_PACKED_DELTA"'/\1:\4/;t;d')
+                for packeddelta in $packeddeltas
+                do
+                    packedobject=$(echo "$packeddelta" | cut -d':' -f1)
+                    deltaobject=$(echo "$packeddelta" | cut -s -d':' -f2)
+                    handle_object "$packedobject"
+                    if [ -n "$deltaobject" ]
+                    then
+                        echo '    "'$packedobject'" -> "'$deltaobject'"'\
+                            '[label="delta", color="#cccccc"]'
+                    fi
+                done
+                ;;
+        esac
+    done
+}
+
+do_heads() {
+    handle_ref HEAD "$(cat "$GIT_DIR/HEAD")"
+    if [ -f "$GIT_DIR/FETCH_HEAD" ]
+    then
+        for fetchtarget in $(cat "$GIT_DIR/FETCH_HEAD" |\
+                                 sed -E 's/^([0-9a-f]{40}).*$/\1/')
+        do
+            handle_ref FETCH_HEAD "$fetchtarget"
+        done
+    fi
+    if [ -f "$GIT_DIR/ORIG_HEAD" ]
+    then
+        handle_ref ORIG_HEAD "$(cat "$GIT_DIR/HEAD")"
+    fi
+}
+
+do_all() {
+    echo 'digraph git {'
+    echo '    edge [color="#777777"]'
+    do_objects
+    do_packed_objects
+    if ! $OPTION_FILTER || $OPTION_REFS
+    then
+        do_refs
+        do_packed_refs
+    fi
+    if ! $OPTION_FILTER || $OPTION_HEADS
+    then
+        do_heads
+    fi
+    echo '}'
+}
+
+if $OPTION_HELP
+then
+    usage
+fi
+
+if $OPTION_SHOW
+then
+    file="$(mktemp --suffix=.svg)"
+    do_all | dot -Tsvg > "$file"
+    xdg-open "$file"
+else
+    do_all
+fi
