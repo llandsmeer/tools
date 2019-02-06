@@ -1,3 +1,5 @@
+/* gcc -O3 dconv.c -o dconv */
+
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
