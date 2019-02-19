@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>
 
+import sys
 import collections
 import contextlib
 import json
@@ -222,6 +223,18 @@ class Timer:
     def poll(self):
         os.read(self.fd, 8)
 
+def setup():
+    from setuptools import setup
+    setup(name='i3focus',
+          py_modules=['i3focus'],
+          author='Lennart Landsmeer',
+          author_email='lennart@landsmeer.email',
+          license='GPLv3',
+          entry_points={
+              'console_scripts': [
+                  'i3-focus = i3focus:main'
+              ]
+     })
 
 def main():
     i3 = I3()
@@ -245,4 +258,8 @@ def main():
         pass
 
 if __name__ == '__main__':
-    main()
+    if 'setup' in sys.argv:
+        sys.argv.remove('setup')
+        setup()
+    else:
+        main()
