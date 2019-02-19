@@ -142,3 +142,6 @@ dst
 1
 ```
  
+# ctrll.el
+
+Fast navigation to definitions in Emacs when pressing Ctrl-L.
